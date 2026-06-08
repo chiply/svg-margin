@@ -623,6 +623,13 @@ clobbered to the global default.")
         (kill-local-variable var))
       (setq svg-margin--saved-display (assq-delete-all var svg-margin--saved-display)))))
 
+(defvar-local svg-margin--last-scale 1.0
+  "Text-scale factor (window font width / frame char width) from last render.
+Window margins are reserved in units of the frame's canonical character width,
+which does not track `text-scale-mode'; the reservation is multiplied by this
+factor so a scaled-up indicator image still fits its margin.  See
+`svg-margin--apply-margins' and `svg-margin--render'.")
+
 (defun svg-margin--apply-margins (left right)
   "Reserve LEFT and RIGHT indicator columns for the buffer and its windows.
 Sets the BUFFER-LOCAL `left-margin-width'/`right-margin-width' so Emacs reserves
@@ -632,8 +639,8 @@ buffer's own margin width before any hook can correct it).  The originals are
 saved (see `svg-margin--save-display-var') for restore on mode off.  Also writes
 any live window whose margins differ, so the change shows immediately without
 inducing a redundant `window-configuration-change-hook'."
-  (let ((lw (* left svg-margin-column-width))
-        (rw (* right svg-margin-column-width)))
+  (let ((lw (ceiling (* left svg-margin-column-width svg-margin--last-scale)))
+        (rw (ceiling (* right svg-margin-column-width svg-margin--last-scale))))
     (svg-margin--save-display-var 'left-margin-width)
     (svg-margin--save-display-var 'right-margin-width)
     (unless (and (eql left-margin-width lw) (eql right-margin-width rw))
@@ -711,12 +718,21 @@ debounced re-render.")
           (save-restriction
             (widen)
             (svg-margin--clear)
-            ;; Size columns/lines from a window actually showing the buffer (its
-            ;; frame's font), falling back to the selected frame when off-screen.
+            ;; Size cells from the DISPLAYING WINDOW's font rather than the
+            ;; frame's canonical font, so indicators track `text-scale-mode' (a
+            ;; buffer-local face remap the frame metrics do not see); fall back
+            ;; to the selected frame when the buffer is off-screen.
             (let* ((win (car (svg-margin--windows)))
                    (frame (if win (window-frame win) (selected-frame)))
-                   (cw (* svg-margin-column-width (frame-char-width frame)))
-                   (lh (max 1 (default-line-height)))
+                   (fcw (max 1 (frame-char-width frame)))
+                   (cw (* svg-margin-column-width
+                          (if win (window-font-width win) fcw)))
+                   (lh (max 1 (if win (window-font-height win)
+                                (default-line-height))))
+                   ;; Margins are reserved in frame-char-width units, which do
+                   ;; not scale with text-scale; widen the reservation by the
+                   ;; same factor so the larger image is not clipped.
+                   (scale (if win (/ (float (window-font-width win)) fcw) 1.0))
                    (groups (svg-margin--group (svg-margin--collect)))
                    (max-left (max 0 svg-margin-min-left-columns))
                    (max-right (max 0 svg-margin-min-right-columns))
@@ -741,7 +757,8 @@ debounced re-render.")
                   (svg-margin--place pos side packed
                                      (if (eq side 'left) max-left max-right)
                                      cw lh)))
-              (setq svg-margin--last-cols (cons max-left max-right))
+              (setq svg-margin--last-cols (cons max-left max-right)
+                    svg-margin--last-scale scale)
               (svg-margin--apply-margins max-left max-right)
               (svg-margin--apply-fringes))))))))
 
@@ -826,9 +843,13 @@ in a terminal (`emacs -nw') it does nothing."
           (message "svg-margin-mode: needs a graphical frame; nothing will show in a terminal"))
         (add-hook 'after-change-functions #'svg-margin--after-change nil t)
         (add-hook 'window-configuration-change-hook #'svg-margin--window-config nil t)
+        ;; Re-render when the buffer's text scale changes so indicator cells are
+        ;; resized to match (see the window-font metrics in `svg-margin--render').
+        (add-hook 'text-scale-mode-hook #'svg-margin--after-change nil t)
         (svg-margin--render (current-buffer)))
     (remove-hook 'after-change-functions #'svg-margin--after-change t)
     (remove-hook 'window-configuration-change-hook #'svg-margin--window-config t)
+    (remove-hook 'text-scale-mode-hook #'svg-margin--after-change t)
     (when (timerp svg-margin--timer) (cancel-timer svg-margin--timer))
     (svg-margin--clear)
     (svg-margin--restore-fringes)
