@@ -63,6 +63,16 @@
 ;;                 tooltip then reads \"...  click to jump\".
 ;;   :menu         an alist of (LABEL . COMMAND); right-click (mouse-3) pops up
 ;;                 a context menu of these and runs the chosen command.
+;;   :background   non-nil makes this a BACKGROUND indicator: it claims no
+;;                 column and is drawn first, spanning the side's full
+;;                 reserved width behind the packed cells (e.g. a scrollbar
+;;                 thumb or a line tint).  Drawn as a filled rectangle of
+;;                 :color/:face, or via :draw called as (FN SVG 0 0 W H
+;;                 COLOR) with W the full image width.  It contributes no
+;;                 width of its own, so the side needs width from regular
+;;                 indicators or `svg-margin-min-*-columns' to be visible;
+;;                 :action/:menu are not supported on backgrounds.
+;;   :opacity      fill opacity 0.0-1.0 for the default background rectangle.
 ;;
 ;; Indicators sharing a (line, side) are packed into columns and drawn into
 ;; a single composite SVG; the margin width on that side grows to the widest
@@ -337,24 +347,30 @@ and (when `svg-margin-debug') position-less indicators are reported."
 (defun svg-margin--pack-columns (indicators)
   "Assign each of INDICATORS a column, packing them side by side.
 Higher `:priority' is placed first.  An explicit free `:column' is
-honoured; otherwise the lowest unoccupied column is used.  Returns a list
-of (:indicator IND :column N)."
+honoured; otherwise the lowest unoccupied column is used.  A `:background'
+indicator is not packed: its cell carries a nil `:column' -- it claims no
+slot and is drawn behind the packed cells, spanning the full image width.
+Returns a list of (:indicator IND :column N-or-nil)."
   (let ((sorted (sort (copy-sequence indicators)
                       (lambda (a b) (> (or (plist-get a :priority) 0)
                                        (or (plist-get b :priority) 0)))))
         (used nil) (result nil))
     (dolist (ind sorted)
-      (let ((col (plist-get ind :column)))
-        (when (or (null col) (memq col used))
-          (setq col 0)
-          (while (memq col used) (setq col (1+ col))))
-        (push col used)
-        (push (list :indicator ind :column col) result)))
+      (if (plist-get ind :background)
+          (push (list :indicator ind :column nil) result)
+        (let ((col (plist-get ind :column)))
+          (when (or (null col) (memq col used))
+            (setq col 0)
+            (while (memq col used) (setq col (1+ col))))
+          (push col used)
+          (push (list :indicator ind :column col) result))))
     (nreverse result)))
 
 (defun svg-margin--max-column (packed)
-  "Return the number of columns occupied by PACKED (max column + 1)."
-  (1+ (apply #'max -1 (mapcar (lambda (c) (plist-get c :column)) packed))))
+  "Return the number of columns occupied by PACKED (max column + 1).
+A background cell (nil `:column') occupies no column."
+  (1+ (apply #'max -1 (mapcar (lambda (c) (or (plist-get c :column) -1))
+                              packed))))
 
 ;;;; Drawing
 ;; ----------------------------------------------------------------
@@ -415,21 +431,35 @@ A cell whose draw signals is skipped so one bad indicator cannot blank the line.
          (w (max 1 (* rcols cw)))
          (svg (svg-create w h))
          (map nil))
+    ;; Background cells first (nil column): full-width, behind everything.
+    (dolist (cell packed)
+      (let ((ind (plist-get cell :indicator)))
+        (when (null (plist-get cell :column))
+          (condition-case err
+              (let ((color (svg-margin--indicator-color ind)))
+                (if (functionp (plist-get ind :draw))
+                    (funcall (plist-get ind :draw) svg 0 0 w h color)
+                  (svg-rectangle svg 0 0 w h
+                                 :fill (svg-margin--color color)
+                                 :fill-opacity (or (plist-get ind :opacity) 1.0))))
+            (error (message "svg-margin: drawing a background failed: %s"
+                            (error-message-string err)))))))
     (dolist (cell packed)
       (let* ((col (plist-get cell :column))
-             (ind (plist-get cell :indicator))
-             (x (if (eq side 'left) (* (- rcols 1 col) cw) (* col cw))))
-        ;; Hover background (drawn first, behind the indicator).
-        (when (and hovered-col (eql col hovered-col))
-          (svg-rectangle svg x 0 cw h :fill (svg-margin--hover-color)))
-        (condition-case err
-            (svg-margin--draw ind svg x 0 cw h)
-          (error (message "svg-margin: drawing an indicator failed: %s"
-                          (error-message-string err))))
-        ;; Per-cell image-map hot-spot: own help-echo (tagged with the cell
-        ;; identity for hover tracking), hand pointer, and the click keymap.
-        (let ((area (svg-margin--cell-area ind x cw h pos side col)))
-          (when area (push area map)))))
+             (ind (plist-get cell :indicator)))
+        (when col
+          (let ((x (if (eq side 'left) (* (- rcols 1 col) cw) (* col cw))))
+            ;; Hover background (drawn first, behind the indicator).
+            (when (and hovered-col (eql col hovered-col))
+              (svg-rectangle svg x 0 cw h :fill (svg-margin--hover-color)))
+            (condition-case err
+                (svg-margin--draw ind svg x 0 cw h)
+              (error (message "svg-margin: drawing an indicator failed: %s"
+                              (error-message-string err))))
+            ;; Per-cell image-map hot-spot: own help-echo (tagged with the cell
+            ;; identity for hover tracking), hand pointer, and the click keymap.
+            (let ((area (svg-margin--cell-area ind x cw h pos side col)))
+              (when area (push area map)))))))
     (let ((props (list :ascent 'center :scale 1.0)))
       (when map (setq props (append props (list :map (nreverse map)))))
       (apply #'svg-image svg props))))
@@ -747,7 +777,9 @@ debounced re-render.")
                    (max-right (max 0 svg-margin-min-right-columns))
                    (cells nil))
               ;; Pass 1: pack each line and find the reserved width per side
-              ;; (at least the configured minimum).
+              ;; (at least the configured minimum).  Background-only lines
+              ;; (ncols 0) still get a cell -- they paint the width others
+              ;; reserve -- but contribute no width of their own.
               (maphash
                (lambda (key inds)
                  (let* ((pos (car key)) (side (cdr key))
@@ -756,7 +788,8 @@ debounced re-render.")
                    (when (> ncols 0)
                      (if (eq side 'left)
                          (setq max-left (max max-left ncols))
-                       (setq max-right (max max-right ncols)))
+                       (setq max-right (max max-right ncols))))
+                   (when packed
                      (push (list pos side packed) cells))))
                groups)
               ;; Pass 2: place each line filling its side's reserved width, so
