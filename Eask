@@ -2,7 +2,7 @@
 
 (package "svg-margin"
 ; x-release-please-start-version
-         "0.1.1"
+         "0.1.2"
 ; x-release-please-end
          "Multi-provider SVG indicators in the window margins")
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/chiply/svg-margin/compare/v0.1.1...v0.1.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* text-scale margin jitter and overlays orphaned by major-mode changes ([#4](https://github.com/chiply/svg-margin/issues/4)) ([661cd09](https://github.com/chiply/svg-margin/commit/661cd09e9bafbe628f4910bf63d8b77350cdfe22))
+
 ## [0.1.1](https://github.com/chiply/svg-margin/compare/v0.1.0...v0.1.1) (2026-06-08)
 
 
