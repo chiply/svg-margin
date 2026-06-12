@@ -246,12 +246,47 @@
     (svg-margin-mode 1)
     (should svg-margin-mode)
     (should (memq #'svg-margin--after-change after-change-functions))
+    (should (memq #'svg-margin--text-scale text-scale-mode-hook))
     (svg-margin-mode -1)
     (should-not svg-margin-mode)
-    (should-not (memq #'svg-margin--after-change after-change-functions))))
+    (should-not (memq #'svg-margin--after-change after-change-functions))
+    (should-not (memq #'svg-margin--text-scale text-scale-mode-hook))))
 
 (ert-deftest svg-margin/global-mode-defined ()
   (should (fboundp 'global-svg-margin-mode)))
+
+(ert-deftest svg-margin/clear-deletes-orphans ()
+  "Overlays the bookkeeping list lost track of are still deleted.
+`kill-all-local-variables' (major-mode change, `revert-buffer') wipes the
+buffer-local list but not the overlays; clearing must not depend on it."
+  (with-temp-buffer
+    (insert "one\ntwo\n")
+    (let ((ov (make-overlay 1 1)))
+      (overlay-put ov 'svg-margin t)
+      (setq svg-margin--overlays nil)   ; simulate the list being wiped
+      (svg-margin--clear)
+      (should-not (overlay-buffer ov)))))
+
+(ert-deftest svg-margin/clear-widens ()
+  "Clearing reaches overlays outside the current narrowing."
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\n")
+    (let ((ov (make-overlay 1 1)))
+      (overlay-put ov 'svg-margin t)
+      (push ov svg-margin--overlays)
+      (narrow-to-region 9 15)
+      (svg-margin--clear)
+      (should-not (overlay-buffer ov)))))
+
+(ert-deftest svg-margin/major-mode-change-clears ()
+  "A major-mode change deletes the overlays before the local state dies."
+  (with-temp-buffer
+    (svg-margin-mode 1)
+    (let ((ov (make-overlay 1 1)))
+      (overlay-put ov 'svg-margin t)
+      (push ov svg-margin--overlays)
+      (fundamental-mode)
+      (should-not (overlay-buffer ov)))))
 
 ;;;; Composite image (needs librsvg)
 
