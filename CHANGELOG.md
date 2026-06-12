@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/chiply/svg-margin/compare/v0.1.2...v0.1.3) (2026-06-12)
+
+
+### Features
+
+* background indicators spanning the margin behind packed cells ([#6](https://github.com/chiply/svg-margin/issues/6)) ([3f110d3](https://github.com/chiply/svg-margin/commit/3f110d30a81784688b01e34ab038439349f29ae6))
+
 ## [0.1.2](https://github.com/chiply/svg-margin/compare/v0.1.1...v0.1.2) (2026-06-12)
 
 
