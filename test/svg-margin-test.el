@@ -288,6 +288,28 @@ buffer-local list but not the overlays; clearing must not depend on it."
       (fundamental-mode)
       (should-not (overlay-buffer ov)))))
 
+;;;; Background indicators
+
+(ert-deftest svg-margin/background-claims-no-column ()
+  "A :background indicator packs with a nil column and occupies no slot."
+  (let* ((packed (svg-margin--pack-columns
+                  '((:background t :color "#888888")
+                    (:shape dot :color "#cc3333")
+                    (:shape bar :color "#3333cc"))))
+         (bg (seq-find (lambda (c) (plist-get (plist-get c :indicator) :background))
+                       packed))
+         (cols (delq nil (mapcar (lambda (c) (plist-get c :column)) packed))))
+    (should bg)
+    (should-not (plist-get bg :column))
+    ;; The two regular indicators still pack densely from column 0.
+    (should (equal (sort cols #'<) '(0 1)))
+    (should (= 2 (svg-margin--max-column packed)))))
+
+(ert-deftest svg-margin/background-only-line-counts-zero-columns ()
+  "A line with only a background occupies zero columns (adds no width)."
+  (should (= 0 (svg-margin--max-column
+                (svg-margin--pack-columns '((:background t :color "#888888")))))))
+
 ;;;; Composite image (needs librsvg)
 
 (ert-deftest svg-margin/image-builds ()
