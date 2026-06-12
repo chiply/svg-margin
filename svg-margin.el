@@ -482,8 +482,17 @@ not consulted (the area id becomes an event prefix)."
   "List of overlays this buffer uses to carry margin images.")
 
 (defun svg-margin--clear ()
-  "Delete all svg-margin overlays in the current buffer."
-  (mapc #'delete-overlay svg-margin--overlays)
+  "Delete all svg-margin overlays in the current buffer.
+Deletes by the overlay's `svg-margin' property over the WIDENED buffer, not
+by walking `svg-margin--overlays': that list is a plain buffer-local, so
+`kill-all-local-variables' (a major-mode change, `revert-buffer', ...) wipes
+it while the overlays themselves survive -- and a list-based clear would
+leave those orphans showing a stale image beside every fresh one (invisible
+while the sizes match, but obvious once `text-scale-mode' makes them
+diverge)."
+  (save-restriction
+    (widen)
+    (remove-overlays (point-min) (point-max) 'svg-margin t))
   (setq svg-margin--overlays nil))
 
 (defun svg-margin--click-column (posn side rcols cw)
@@ -805,6 +814,18 @@ the cell identity in its `svg-margin-cell' text property (see
   "Schedule a re-render after a buffer change."
   (svg-margin--schedule))
 
+(defun svg-margin--text-scale ()
+  "Re-render synchronously after a text-scale change.
+The face remap installed by `text-scale-mode' resizes the buffer text on the
+very next redisplay; going through the debounced idle timer would resize the
+margin a beat later, snapping the text sideways.  This hook runs inside the
+text-scale command, before that redisplay, and `window-font-width' already
+reflects the new remap -- so rendering here lands the new margin width and
+cell images in the same frame as the resized text.  Any pending debounced
+render is dropped, as this render supersedes it."
+  (when (timerp svg-margin--timer) (cancel-timer svg-margin--timer))
+  (svg-margin--render (current-buffer)))
+
 (defun svg-margin--window-config ()
   "Apply the cached margin width immediately, then schedule a re-render.
 Applying the cached width synchronously (rather than waiting for the debounced
@@ -843,13 +864,21 @@ in a terminal (`emacs -nw') it does nothing."
           (message "svg-margin-mode: needs a graphical frame; nothing will show in a terminal"))
         (add-hook 'after-change-functions #'svg-margin--after-change nil t)
         (add-hook 'window-configuration-change-hook #'svg-margin--window-config nil t)
+        ;; A major-mode change kills the buffer-local state (including the
+        ;; mode itself) WITHOUT running the mode-off body, but the overlays
+        ;; survive -- delete them while they are still tracked, or they
+        ;; linger as untracked stale images.
+        (add-hook 'change-major-mode-hook #'svg-margin--clear nil t)
         ;; Re-render when the buffer's text scale changes so indicator cells are
         ;; resized to match (see the window-font metrics in `svg-margin--render').
-        (add-hook 'text-scale-mode-hook #'svg-margin--after-change nil t)
+        ;; Synchronous (not debounced) so the margin resizes in the same
+        ;; redisplay as the text, with no sideways snap.
+        (add-hook 'text-scale-mode-hook #'svg-margin--text-scale nil t)
         (svg-margin--render (current-buffer)))
     (remove-hook 'after-change-functions #'svg-margin--after-change t)
     (remove-hook 'window-configuration-change-hook #'svg-margin--window-config t)
-    (remove-hook 'text-scale-mode-hook #'svg-margin--after-change t)
+    (remove-hook 'change-major-mode-hook #'svg-margin--clear t)
+    (remove-hook 'text-scale-mode-hook #'svg-margin--text-scale t)
     (when (timerp svg-margin--timer) (cancel-timer svg-margin--timer))
     (svg-margin--clear)
     (svg-margin--restore-fringes)
