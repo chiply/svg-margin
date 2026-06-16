@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/chiply/svg-margin/compare/v0.1.4...v0.1.5) (2026-06-16)
+
+
+### Features
+
+* hover mode, configurable global predicate, :weight; drop render cache ([#10](https://github.com/chiply/svg-margin/issues/10)) ([835818e](https://github.com/chiply/svg-margin/commit/835818e4b9f44655ea0fee13940890d7c1fc3aa8))
+
 ## [0.1.4](https://github.com/chiply/svg-margin/compare/v0.1.3...v0.1.4) (2026-06-16)
 
 
