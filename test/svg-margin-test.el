@@ -310,6 +310,67 @@ buffer-local list but not the overlays; clearing must not depend on it."
   (should (= 0 (svg-margin--max-column
                 (svg-margin--pack-columns '((:background t :color "#888888")))))))
 
+;;;; Text weight
+
+(ert-deftest svg-margin/draw-text-weight ()
+  "`:weight' overrides the default bold font-weight; default is bold."
+  (let ((svg (svg-create 20 14)))
+    (svg-margin--draw-text svg "x" 0 0 20 14 "#123456" nil nil "300")
+    (should (equal (dom-attr (car (dom-by-tag svg 'text)) 'font-weight) "300")))
+  (let ((svg (svg-create 20 14)))
+    (svg-margin--draw-text svg "x" 0 0 20 14 "#123456")
+    (should (equal (dom-attr (car (dom-by-tag svg 'text)) 'font-weight) "bold"))))
+
+(ert-deftest svg-margin/draw-passes-weight ()
+  "`svg-margin--draw' forwards `:weight' to the text drawer."
+  (let ((svg (svg-create 20 14)))
+    (svg-margin--draw '(:text "x" :color "#fff" :weight "300") svg 0 0 20 14)
+    (should (equal (dom-attr (car (dom-by-tag svg 'text)) 'font-weight) "300"))))
+
+;;;; Hover
+
+(ert-deftest svg-margin/note-help-obsolete-alias ()
+  "The old private `svg-margin--note-help' name still resolves to the public one."
+  (should (eq (indirect-function 'svg-margin--note-help)
+              (indirect-function 'svg-margin-note-help))))
+
+(ert-deftest svg-margin/hover-mode-wires-show-help ()
+  "`svg-margin-hover-mode' installs then removes a `show-help-function' wrapper."
+  (let ((show-help-function nil)
+        (svg-margin-hover-highlight nil)
+        (svg-margin--prev-show-help nil))
+    (svg-margin-hover-mode 1)
+    (unwind-protect
+        (progn
+          (should svg-margin-hover-highlight)
+          (should (eq show-help-function #'svg-margin--show-help)))
+      (svg-margin-hover-mode -1))
+    (should-not svg-margin-hover-highlight)
+    (should-not show-help-function)))
+
+(ert-deftest svg-margin/hover-mode-chains-prior ()
+  "Enabling preserves and chains a prior `show-help-function'."
+  (let* ((seen nil)
+         (show-help-function (lambda (h) (setq seen h)))
+         (svg-margin-hover-highlight nil)
+         (svg-margin--prev-show-help nil))
+    (svg-margin-hover-mode 1)
+    (unwind-protect
+        (progn (funcall show-help-function "x")
+               (should (equal seen "x")))      ; prior wrapper still called
+      (svg-margin-hover-mode -1))))
+
+;;;; Global predicate
+
+(ert-deftest svg-margin/global-predicate ()
+  "`svg-margin--maybe-enable' respects `svg-margin-global-predicate'."
+  (with-temp-buffer
+    (should-not (svg-margin-file-buffer-p))    ; no file -> default is nil
+    (let ((svg-margin-global-predicate (lambda () t)))
+      (svg-margin--maybe-enable)
+      (should svg-margin-mode)
+      (svg-margin-mode -1))))
+
 ;;;; Composite image (needs librsvg)
 
 (ert-deftest svg-margin/image-builds ()

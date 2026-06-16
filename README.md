@@ -69,6 +69,10 @@ indicator plists. Register one, then enable the mode:
 Indicators sharing a `(line, side)` are packed into columns and drawn into a
 single composite image; the margin width on that side grows to the widest line.
 
+`global-svg-margin-mode` enables the mode in file-visiting buffers by default;
+set `svg-margin-global-predicate` to a function of your own to change which
+buffers qualify.
+
 ## Indicator plists
 
 An indicator plist recognises:
@@ -83,6 +87,7 @@ An indicator plist recognises:
 | `:text`        | a short string drawn centred (e.g. an icon glyph or mark letter)    |
 | `:font`        | font family for `:text` (e.g. a Nerd Font); defaults to `default`  |
 | `:scale`       | multiplies the glyph height fraction (raise for icon glyphs)        |
+| `:weight`      | font weight for `:text` (default `"bold"`)                          |
 | `:draw`        | a function `(SVG X Y W H COLOR)` for full control                   |
 | `:color`/`:face` | fill colour, or a face whose foreground is used                  |
 | `:help`        | tooltip string (shown when hovering just this indicator)            |
@@ -139,23 +144,30 @@ the fringe space:
 
 ## Hover highlight (opt-in)
 
-A margin delivers mouse enter/leave only through the help-echo machinery, so a
-package cannot turn on the hover highlight by itself. To enable it, wire
-`show-help-function` to call `svg-margin--note-help` (then display the help as
-usual), and set `svg-margin-hover-highlight`:
+A margin only delivers mouse enter/leave through the help-echo machinery, so the
+hover highlight needs a `show-help-function` hook. The easy way is the global
+minor mode — it installs that hook (chaining any existing one) and sets
+`svg-margin-hover-highlight`:
+
+```elisp
+(svg-margin-hover-mode 1)
+```
+
+A `svg-margin-hover-color` background is then drawn behind the indicator under
+the mouse. (Clicks and tooltips work regardless of this mode.)
+
+If you already maintain your own `show-help-function` wrapper, call the public
+`svg-margin-note-help` from it and set `svg-margin-hover-highlight` yourself
+instead of enabling the mode:
 
 ```elisp
 (setq svg-margin-hover-highlight t)
-
 (let ((orig show-help-function))
   (setq show-help-function
         (lambda (help)
-          (svg-margin--note-help help)
+          (svg-margin-note-help help)
           (when orig (funcall orig help)))))
 ```
-
-With that in place, a `svg-margin-hover-color` background is drawn behind the
-indicator under the mouse (clicks and tooltips work regardless).
 
 ## License
 

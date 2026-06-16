@@ -54,6 +54,9 @@
 ;;   :priority     higher is packed first (default 0)
 ;;   :shape        a registered shape symbol (see `svg-margin-define-shape')
 ;;   :text         a short string drawn centred (e.g. an evil mark letter)
+;;   :font         font family for `:text' (e.g. a Nerd Font icon glyph)
+;;   :scale        multiplies the `:text' glyph height fraction (icon glyphs)
+;;   :weight       font weight for `:text' (default \"bold\")
 ;;   :draw         a function (SVG X Y W H COLOR) for full control
 ;;   :color/:face  fill colour, or a face whose foreground is used
 ;;   :help         tooltip string (shown when hovering just this indicator)
@@ -78,6 +81,10 @@
 ;; a single composite SVG; the margin width on that side grows to the widest
 ;; line.  Providers are decoupled, so several packages can contribute to the
 ;; same gutter and stack on one line.
+;;
+;; Note: a provider is called with the whole (widened) buffer on every
+;; (debounced) render, so keep its scan cheap -- or cache it -- in large
+;; buffers; the engine itself does no per-line work beyond what providers emit.
 ;;
 ;; A provider may set per-provider defaults so it need not stamp every
 ;; indicator: (svg-margin-register-provider NAME FN :side 'right :priority 5).
@@ -172,9 +179,9 @@ the margin.  This is why it is applied to every margin string, not just org's.")
 
 (defcustom svg-margin-hover-highlight nil
   "When non-nil, draw a background behind the indicator under the mouse.
-This needs `show-help-function' wired to call `svg-margin--note-help' (the
-package cannot change that global on its own -- see the README), since
-the mouse-enter/leave signal comes through the help-echo machinery."
+The hover signal arrives through the help-echo machinery, so this also needs a
+`show-help-function' that feeds `svg-margin-note-help'.  The easy way to get
+both is `svg-margin-hover-mode', which sets this and installs that wrapper."
   :type 'boolean)
 
 (defcustom svg-margin-hover-color nil
@@ -383,18 +390,19 @@ A background cell (nil `:column') occupies no column."
       (face-foreground 'default nil 'default)
       "#000000"))
 
-(defun svg-margin--draw-text (svg text x y w h color &optional font scale)
+(defun svg-margin--draw-text (svg text x y w h color &optional font scale weight)
   "Draw TEXT centred in the (X Y W H) cell of SVG in COLOR.
 FONT overrides the font family (e.g. a Nerd Font for an icon glyph; defaults to
 the `default' face family).  SCALE multiplies the glyph height fraction (default
-0.7) -- raise it for icon glyphs whose ink is smaller than their em box."
+0.7) -- raise it for icon glyphs whose ink is smaller than their em box.  WEIGHT
+is the SVG font-weight (default \"bold\")."
   (let ((fs (max 6 (round (* h 0.7 (or scale 1.0))))))
     (svg-text svg text
               :x (+ x (/ w 2.0))
               :y (+ y (/ h 2.0) (* fs 0.35))
               :font-size fs
               :font-family (or font (face-attribute 'default :family nil t))
-              :font-weight "bold"
+              :font-weight (or weight "bold")
               :text-anchor "middle"
               :fill (svg-margin--color color))))
 
@@ -406,7 +414,8 @@ A non-function `:draw' is ignored (falls through to `:text'/`:shape')."
      ((functionp (plist-get ind :draw)) (funcall (plist-get ind :draw) svg x y w h color))
      ((plist-get ind :text)
       (svg-margin--draw-text svg (plist-get ind :text) x y w h color
-                             (plist-get ind :font) (plist-get ind :scale)))
+                             (plist-get ind :font) (plist-get ind :scale)
+                             (plist-get ind :weight)))
      ((gethash (plist-get ind :shape) svg-margin--shapes)
       (funcall (gethash (plist-get ind :shape) svg-margin--shapes) svg x y w h color))
      (t (svg-margin--shape-dot svg x y w h color)))))
@@ -738,12 +747,6 @@ match so the change shows immediately."
 ;;;; Render
 ;; ----------------------------------------------------------------
 
-(defvar-local svg-margin--render-cache nil
-  "Cached content + geometry from this buffer's last full render.
-Plist `(:content HASH :cw CW :lh LH :left N :right N)' where HASH maps a
-buffer position to `(LEFT-PACKED . RIGHT-PACKED)'.  An external scroll layer
-re-composites visible lines from this without re-running providers.")
-
 (defvar-local svg-margin--last-cols nil
   "Cons (LEFT . RIGHT) reserved columns from this buffer's last render.
 Applied synchronously when the buffer is (re)displayed (see
@@ -807,19 +810,6 @@ debounced re-render.")
                                      cw lh)))
               (setq svg-margin--last-cols (cons max-left max-right)
                     svg-margin--last-scale scale)
-              ;; Cache this render's per-position content + geometry so an
-              ;; external scroll layer can re-composite visible lines cheaply
-              ;; (without re-running providers) on every scroll.  Hash maps a
-              ;; buffer position to (LEFT-PACKED . RIGHT-PACKED).
-              (let ((cache (make-hash-table :test 'eq)))
-                (dolist (c cells)
-                  (cl-destructuring-bind (pos side packed) c
-                    (let ((cell (or (gethash pos cache) (cons nil nil))))
-                      (if (eq side 'left) (setcar cell packed) (setcdr cell packed))
-                      (puthash pos cell cache))))
-                (setq svg-margin--render-cache
-                      (list :content cache :cw cw :lh lh
-                            :left max-left :right max-right)))
               (svg-margin--apply-margins max-left max-right)
               (svg-margin--apply-fringes))))))))
 
@@ -846,13 +836,14 @@ Falls back to the configured minimum columns before the first render."
               (run-with-idle-timer svg-margin-idle-delay nil
                                    #'svg-margin--render buf))))))
 
-(defun svg-margin--note-help (help)
-  "Update the hovered cell from HELP and re-render if it changed.
-Wire `show-help-function' to call this (then display HELP as usual): it fires
-on mouse enter, move AND leave (leave calls it with nil), so the hovered cell
-can be tracked and `svg-margin-hover-highlight' drawn behind it.  HELP carries
-the cell identity in its `svg-margin-cell' text property (see
-`svg-margin--cell-area')."
+;;;###autoload
+(defun svg-margin-note-help (help)
+  "Track the hovered indicator from HELP and re-render if it changed.
+Feed this from `show-help-function' (then display HELP as usual): it fires on
+mouse enter, move AND leave (leave calls it with nil), so the hovered cell can
+be tracked and `svg-margin-hover-highlight' drawn behind it.  HELP carries the
+cell identity in its `svg-margin-cell' text property (see
+`svg-margin--cell-area').  `svg-margin-hover-mode' wires this up for you."
   (when svg-margin-hover-highlight
     (let ((cell (and (stringp help) (> (length help) 0)
                      (get-text-property 0 'svg-margin-cell help))))
@@ -861,6 +852,9 @@ the cell identity in its `svg-margin-cell' text property (see
           (setq svg-margin--hovered cell)
           (dolist (c (delq nil (list (car-safe old) (car-safe cell))))
             (when (buffer-live-p c) (svg-margin--schedule c))))))))
+
+(define-obsolete-function-alias 'svg-margin--note-help
+  'svg-margin-note-help "0.2.0")
 
 (defun svg-margin--after-change (&rest _)
   "Schedule a re-render after a buffer change."
@@ -936,14 +930,62 @@ in a terminal (`emacs -nw') it does nothing."
     (svg-margin--restore-fringes)
     (svg-margin--restore-margins)))
 
+(defun svg-margin-file-buffer-p ()
+  "Default `svg-margin-global-predicate': non-nil in a file-visiting buffer."
+  (and (not (minibufferp)) buffer-file-name))
+
+(defcustom svg-margin-global-predicate #'svg-margin-file-buffer-p
+  "Predicate deciding whether `global-svg-margin-mode' enables in a buffer.
+Called with no arguments in the candidate buffer; a non-nil return turns the
+mode on there.  The default, `svg-margin-file-buffer-p', enables in ordinary
+file-visiting buffers."
+  :type 'function)
+
 (defun svg-margin--maybe-enable ()
-  "Turn on `svg-margin-mode' in an ordinary file buffer."
-  (when (and (not (minibufferp)) buffer-file-name)
+  "Turn on `svg-margin-mode' where `svg-margin-global-predicate' allows."
+  (when (funcall svg-margin-global-predicate)
     (svg-margin-mode 1)))
 
 ;;;###autoload
 (define-globalized-minor-mode global-svg-margin-mode
   svg-margin-mode svg-margin--maybe-enable)
+
+;;;; Hover highlight
+;; ----------------------------------------------------------------
+
+(defvar svg-margin--prev-show-help nil
+  "The `show-help-function' in effect before `svg-margin-hover-mode'.")
+
+(defun svg-margin--show-help (help)
+  "Feed HELP to `svg-margin-note-help', then display it as before.
+Installed as `show-help-function' by `svg-margin-hover-mode'."
+  (svg-margin-note-help help)
+  (when (functionp svg-margin--prev-show-help)
+    (funcall svg-margin--prev-show-help help)))
+
+;;;###autoload
+(define-minor-mode svg-margin-hover-mode
+  "Highlight the svg-margin indicator under the mouse pointer.
+
+A margin only delivers mouse enter/leave through the help-echo machinery, so
+this installs a `show-help-function' wrapper -- chaining the previous one --
+that feeds `svg-margin-note-help', and sets `svg-margin-hover-highlight' so the
+renderer draws `svg-margin-hover-color' behind the hovered cell.  It composes
+with other `show-help-function' users: each wrapper chains the prior."
+  :global t
+  (if svg-margin-hover-mode
+      (progn
+        (setq svg-margin-hover-highlight t)
+        (unless (eq show-help-function #'svg-margin--show-help)
+          (setq svg-margin--prev-show-help show-help-function
+                show-help-function #'svg-margin--show-help)))
+    (setq svg-margin-hover-highlight nil)
+    ;; Unwrap only if we are still the top wrapper; otherwise leave ours in
+    ;; place -- with the highlight off `svg-margin-note-help' is a no-op pass.
+    (when (eq show-help-function #'svg-margin--show-help)
+      (setq show-help-function svg-margin--prev-show-help
+            svg-margin--prev-show-help nil))
+    (svg-margin-refresh-all)))
 
 (provide 'svg-margin)
 ;;; svg-margin.el ends here
