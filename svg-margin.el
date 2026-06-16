@@ -738,6 +738,12 @@ match so the change shows immediately."
 ;;;; Render
 ;; ----------------------------------------------------------------
 
+(defvar-local svg-margin--render-cache nil
+  "Cached content + geometry from this buffer's last full render.
+Plist `(:content HASH :cw CW :lh LH :left N :right N)' where HASH maps a
+buffer position to `(LEFT-PACKED . RIGHT-PACKED)'.  An external scroll layer
+re-composites visible lines from this without re-running providers.")
+
 (defvar-local svg-margin--last-cols nil
   "Cons (LEFT . RIGHT) reserved columns from this buffer's last render.
 Applied synchronously when the buffer is (re)displayed (see
@@ -801,6 +807,19 @@ debounced re-render.")
                                      cw lh)))
               (setq svg-margin--last-cols (cons max-left max-right)
                     svg-margin--last-scale scale)
+              ;; Cache this render's per-position content + geometry so an
+              ;; external scroll layer can re-composite visible lines cheaply
+              ;; (without re-running providers) on every scroll.  Hash maps a
+              ;; buffer position to (LEFT-PACKED . RIGHT-PACKED).
+              (let ((cache (make-hash-table :test 'eq)))
+                (dolist (c cells)
+                  (cl-destructuring-bind (pos side packed) c
+                    (let ((cell (or (gethash pos cache) (cons nil nil))))
+                      (if (eq side 'left) (setcar cell packed) (setcdr cell packed))
+                      (puthash pos cell cache))))
+                (setq svg-margin--render-cache
+                      (list :content cache :cw cw :lh lh
+                            :left max-left :right max-right)))
               (svg-margin--apply-margins max-left max-right)
               (svg-margin--apply-fringes))))))))
 
