@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/chiply/svg-margin/compare/v0.1.3...v0.1.4) (2026-06-16)
+
+
+### Features
+
+* cache per-render content + geometry for external scroll layers ([#8](https://github.com/chiply/svg-margin/issues/8)) ([07236cc](https://github.com/chiply/svg-margin/commit/07236cc702b8ad0c4a5fddf6a73ce0b27297c0af))
+
 ## [0.1.3](https://github.com/chiply/svg-margin/compare/v0.1.2...v0.1.3) (2026-06-12)
 
 
