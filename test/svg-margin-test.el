@@ -189,6 +189,181 @@
   (should (= 2 (svg-margin--max-column '((:column 0) (:column 1)))))
   (should (= 0 (svg-margin--max-column nil))))
 
+;;;; Fixed arrangement
+
+(ert-deftest svg-margin/arrange-fixed-honours-column ()
+  "Under `fixed', a `:column' is a dedicated lane kept even when alone."
+  (let ((packed (svg-margin--arrange-fixed '((:id a :column 3)))))
+    (should (= 1 (length packed)))
+    (should (= 3 (plist-get (car packed) :column)))
+    (should (= 4 (svg-margin--max-column packed)))))
+
+(ert-deftest svg-margin/arrange-fixed-floats-around-fixed ()
+  "Column-less indicators fill the free lanes around the fixed ones."
+  (let* ((packed (svg-margin--arrange-fixed '((:id fixed :column 1)
+                                              (:id x) (:id y))))
+         (col (lambda (id)
+                (plist-get
+                 (cl-find-if (lambda (c)
+                               (eq id (plist-get (plist-get c :indicator) :id)))
+                             packed)
+                 :column))))
+    (should (= 1 (funcall col 'fixed)))
+    ;; The two column-less indicators take the lowest free lanes, 0 and 2.
+    (should (equal '(0 2) (sort (list (funcall col 'x) (funcall col 'y)) #'<)))))
+
+(ert-deftest svg-margin/arrange-fixed-collision-keeps-priority ()
+  "On a shared fixed lane the higher `:priority' keeps it; the other drops."
+  (let ((packed (svg-margin--arrange-fixed '((:id lo :column 2 :priority 0)
+                                             (:id hi :column 2 :priority 5)))))
+    (should (equal '(hi) (mapcar (lambda (c) (plist-get (plist-get c :indicator) :id))
+                                 packed)))
+    (should (= 2 (plist-get (car packed) :column)))))
+
+(ert-deftest svg-margin/arrange-fixed-background-no-column ()
+  "A `:background' indicator claims no lane under `fixed'."
+  (let* ((packed (svg-margin--arrange-fixed '((:background t) (:id a :column 0))))
+         (bg (cl-find-if (lambda (c) (plist-get (plist-get c :indicator) :background))
+                         packed)))
+    (should bg)
+    (should-not (plist-get bg :column))))
+
+(ert-deftest svg-margin/arrange-fixed-collision-float ()
+  "With `float' collision the loser re-flows to a free lane instead of dropping."
+  (let* ((svg-margin-fixed-collision 'float)
+         (packed (svg-margin--arrange-fixed '((:id lo :column 2 :priority 0)
+                                              (:id hi :column 2 :priority 5))))
+         (byid (lambda (id) (cl-find-if
+                             (lambda (c) (eq id (plist-get (plist-get c :indicator) :id)))
+                             packed))))
+    (should (= 2 (length packed)))                         ; both kept
+    (should (= 2 (plist-get (funcall byid 'hi) :column)))  ; winner keeps the lane
+    (should (= 0 (plist-get (funcall byid 'lo) :column))))) ; loser re-flows to lane 0
+
+;;;; Arrangement selection
+
+(ert-deftest svg-margin/arrangement-resolver ()
+  "`svg-margin--arrangement' reads a bare symbol or a per-side alist."
+  (let ((svg-margin-arrangement 'fixed))
+    (should (eq 'fixed (svg-margin--arrangement 'left)))
+    (should (eq 'fixed (svg-margin--arrangement 'right))))
+  (let ((svg-margin-arrangement '((left . fixed) (right . fill))))
+    (should (eq 'fixed (svg-margin--arrangement 'left)))
+    (should (eq 'fill (svg-margin--arrangement 'right))))
+  ;; An unlisted side falls back to fill.
+  (let ((svg-margin-arrangement '((left . fixed))))
+    (should (eq 'fill (svg-margin--arrangement 'right)))))
+
+(ert-deftest svg-margin/arrange-dispatch ()
+  "`svg-margin--arrange' routes to the fixed or fill algorithm per side."
+  (let ((inds '((:id a :column 0 :priority 5) (:id b :column 0 :priority 0))))
+    ;; Fixed: the lane collision drops the loser (one cell remains).
+    (let ((svg-margin-arrangement 'fixed))
+      (should (= 1 (length (svg-margin--arrange inds 'left)))))
+    ;; Fill: the collision bumps the loser to the next lane (two cells).
+    (let ((svg-margin-arrangement 'fill))
+      (should (= 2 (length (svg-margin--arrange inds 'left)))))))
+
+;;;; Compose (the layout seam)
+
+(ert-deftest svg-margin/compose-reserves-per-side ()
+  "`svg-margin--compose' reserves each side's width and returns its lines."
+  (let* ((svg-margin-arrangement 'fill)
+         (layout (svg-margin--compose '((:pos 1 :side left :id a)
+                                        (:pos 1 :side left :id b)
+                                        (:pos 5 :side right :id c)))))
+    (should (= 2 (plist-get layout :left)))
+    (should (= 1 (plist-get layout :right)))
+    (should (= 2 (length (plist-get layout :lines))))))
+
+(ert-deftest svg-margin/compose-honours-minimums ()
+  "Reserved columns never fall below the configured minimums."
+  (let ((layout (svg-margin--compose '((:pos 1 :side left :id a))
+                                     :min-left 3 :min-right 2)))
+    (should (= 3 (plist-get layout :left)))
+    (should (= 2 (plist-get layout :right)))))
+
+(ert-deftest svg-margin/compose-background-only-adds-no-width ()
+  "A background-only line yields a cell but reserves no width of its own."
+  (let ((layout (svg-margin--compose '((:pos 1 :side left :background t)))))
+    (should (= 0 (plist-get layout :left)))
+    (should (= 1 (length (plist-get layout :lines))))))
+
+(ert-deftest svg-margin/provider-columns-override ()
+  "`svg-margin-provider-columns' forces a provider's indicators into a lane."
+  ;; Direct: the OVERRIDE-COLUMN argument wins over the indicator's own.
+  (should (= 7 (plist-get (svg-margin--apply-provider-defaults
+                           '(:line 1 :column 2) '(:fn ignore) nil 7)
+                          :column)))
+  ;; Through `svg-margin--collect' via `svg-margin-provider-columns'.
+  (with-temp-buffer
+    (insert "l1\nl2\n")
+    (let ((svg-margin--providers nil)
+          (svg-margin-provider-columns '((p . 4))))
+      (svg-margin-register-provider 'p (lambda (_b) (list (list :line 1 :column 1))))
+      (let ((out (svg-margin--collect)))
+        (should (= 1 (length out)))
+        (should (= 4 (plist-get (car out) :column)))))))
+
+;;;; Text renderer
+
+(ert-deftest svg-margin/cell-glyph ()
+  "`svg-margin--cell-glyph' uses :text, then a mapped shape char, then fallback."
+  (should (equal "x" (svg-margin--cell-glyph '(:text "x" :shape dot))))
+  (should (equal (alist-get 'dot svg-margin-shape-characters)
+                 (svg-margin--cell-glyph '(:shape dot))))
+  (should (equal svg-margin-text-fallback (svg-margin--cell-glyph '(:color "#fff")))))
+
+(ert-deftest svg-margin/text-face ()
+  "`svg-margin--text-face' builds a foreground from :color, or uses :face."
+  (should (equal '(:foreground "#abcdef") (svg-margin--text-face '(:color "#abcdef"))))
+  (should (eq 'warning (svg-margin--text-face '(:face warning))))
+  ;; With a hover background the base face and background combine.
+  (should (equal '(warning (:background "#123456"))
+                 (svg-margin--text-face '(:face warning) "#123456"))))
+
+(ert-deftest svg-margin/text-margin-glyphs-and-lanes ()
+  "`svg-margin--text-margin' renders glyphs into their columns per side.
+`equal' ignores text properties, so this checks the glyph layout only."
+  (let ((svg-margin-column-width 1)
+        (packed '((:indicator (:text "A") :column 0)
+                  (:indicator (:text "B") :column 2))))
+    ;; Left margin lays out the highest column first: [col2][col1][col0].
+    (should (equal "B A" (svg-margin--text-margin packed 'left 3 1 nil)))
+    ;; Right margin puts column 0 leftmost: [col0][col1][col2].
+    (should (equal "A B" (svg-margin--text-margin packed 'right 3 1 nil)))))
+
+(ert-deftest svg-margin/text-margin-fallback-glyph ()
+  "A shapeless, textless indicator draws the fallback glyph."
+  (let ((svg-margin-column-width 1)
+        (svg-margin-text-fallback "•"))
+    (should (equal "•" (svg-margin--text-margin '((:indicator (:color "#fff") :column 0))
+                                                'left 1 1 nil)))))
+
+(ert-deftest svg-margin/renderer-usable-p ()
+  "The `text' renderer is usable on any frame; `svg' needs a graphical one.
+Runs in batch, where `display-graphic-p' is nil (like a terminal)."
+  (let ((svg-margin-renderer 'text))
+    (should (svg-margin--renderer-usable-p)))          ; usable even non-graphically
+  (let ((svg-margin-renderer 'svg))
+    ;; `svg' tracks `display-graphic-p' exactly -- nil here, so unusable.
+    (should (eq (display-graphic-p) (svg-margin--renderer-usable-p)))))
+
+(ert-deftest svg-margin/setter-commands ()
+  "The setter and toggle commands update the customs globally."
+  (let ((r svg-margin-renderer) (a svg-margin-arrangement))
+    (unwind-protect
+        (progn
+          (svg-margin-set-renderer 'text)
+          (should (eq svg-margin-renderer 'text))
+          (svg-margin-toggle-renderer)
+          (should (eq svg-margin-renderer 'svg))
+          (svg-margin-set-arrangement 'fixed)
+          (should (eq svg-margin-arrangement 'fixed))
+          (svg-margin-toggle-arrangement)
+          (should (eq svg-margin-arrangement 'fill)))
+      (setq-default svg-margin-renderer r svg-margin-arrangement a))))
+
 ;;;; Hover help & hot-spots
 
 (ert-deftest svg-margin/area-help-composition ()
