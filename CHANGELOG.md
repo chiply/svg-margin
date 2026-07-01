@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/chiply/svg-margin/compare/v0.1.5...v0.1.6) (2026-07-01)
+
+
+### Features
+
+* fixed arrangement, text renderer, standalone compositor core ([#12](https://github.com/chiply/svg-margin/issues/12)) ([fd066de](https://github.com/chiply/svg-margin/commit/fd066dec1feefd55882fbe191c6e022d5cc1fb96))
+
 ## [0.1.5](https://github.com/chiply/svg-margin/compare/v0.1.4...v0.1.5) (2026-06-16)
 
 
