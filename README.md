@@ -5,7 +5,8 @@
 
 Turn the window margins into a flexible, multi-column gutter that many
 independent sources ("providers") can draw into, with their indicators packed
-side by side on the same line. Supports Emacs 29.1+ (graphical only).
+side by side on the same line. Supports Emacs 29.1+ (the default SVG renderer
+needs a graphical frame; the `text` renderer also works in the terminal).
 
 ## Overview
 
@@ -15,7 +16,9 @@ composites *every* indicator for a line/side into **one** SVG image at exact
 pixel coordinates, on either the left or the right margin:
 
 - **Multi-column packing** — several indicators on the same line stack side by
-  side into columns; the margin grows to the widest line.
+  side into columns (densely, or into dedicated per-provider lanes — see
+  [Arrangement](#arrangement-fill-vs-fixed-columns)); the margin grows to the
+  widest line.
 - **Decoupled providers** — independent packages can each contribute to the
   same gutter without knowing about one another.
 - **Any drawing** — built-in shapes (dot, ring, bar, box, triangle), centred
@@ -26,7 +29,10 @@ pixel coordinates, on either the left or the right margin:
   to a buffer doesn't shift its text as indicators render in.
 
 svg-margin is the rendering **engine** only: it ships no providers and no
-colours. You (or a small adapter) supply providers.
+colours. You (or a small adapter) supply providers. The column-allocation
+**compositor** — the provider registry, indicator collection, and per-line
+arrangement — lives in the renderer-independent `svg-margin-core`; this package
+is the SVG renderer built on top of it.
 
 ## Installation
 
@@ -81,7 +87,7 @@ An indicator plist recognises:
 |----------------|---------------------------------------------------------------------|
 | `:pos`/`:line` | buffer position or 1-based line (one is required)                    |
 | `:side`        | `left` (default `svg-margin-default-side`) or `right`               |
-| `:column`      | explicit slot (0 = nearest the text); else auto-packed              |
+| `:column`      | column index (0 = nearest the text); soft hint in `fill`, a dedicated lane in `fixed` (see [Arrangement](#arrangement-fill-vs-fixed-columns)) |
 | `:priority`    | higher is packed first (default 0)                                  |
 | `:shape`       | a registered shape symbol (see `svg-margin-define-shape`)           |
 | `:text`        | a short string drawn centred (e.g. an icon glyph or mark letter)    |
@@ -120,6 +126,84 @@ relocate any provider's margin declaratively (without editing it):
 ;; Move a third-party provider to the other margin, no source edit:
 (setq svg-margin-provider-sides '((some-other-provider . right)))
 ```
+
+## Arrangement: fill vs fixed columns
+
+`svg-margin-arrangement` controls how indicators sharing a line are assigned to
+columns:
+
+- **`fill`** (default) — pack indicators densely from the column nearest the
+  text, ordered by `:priority`. An explicit `:column` is a soft hint that is
+  bumped aside when its slot is already taken. Best when you just want
+  indicators to stack tightly.
+- **`fixed`** — treat `:column` as a *dedicated lane* kept on every line. Each
+  indicator stays in its assigned column, empty lanes are left empty, and
+  indicators without a `:column` fill the free lanes by priority. When two
+  indicators claim the same lane the higher `:priority` keeps it (see
+  `svg-margin-fixed-collision` to re-flow the loser into a free lane instead of
+  dropping it). This gives
+  each provider a stable column the eye can track — the behaviour requested for
+  [shared margins](https://lists.gnu.org/r/emacs-devel/2025-10/msg00188.html),
+  where flymake, outline and hideshow indicators each want their own column.
+
+Assign a provider's lane declaratively with `svg-margin-provider-columns` — no
+need to edit the provider — then switch on the fixed arrangement:
+
+```elisp
+(setq svg-margin-arrangement 'fixed
+      svg-margin-provider-columns '((flymake  . 0)    ; 0 = nearest the text
+                                    (outline  . 1)
+                                    (hideshow . 2)))
+```
+
+Each margin can use a different arrangement by giving an alist instead of a
+symbol:
+
+```elisp
+(setq svg-margin-arrangement '((left . fixed) (right . fill)))
+```
+
+## Renderers: SVG or built-in margin text
+
+`svg-margin-renderer` selects how the composed indicators are drawn:
+
+- **`svg`** (default) — composite each line into one SVG image: arbitrary
+  shapes, colours and exact pixel placement. Needs a graphical frame with SVG
+  support.
+- **`text`** — draw each indicator's glyph straight into the built-in margin as
+  ordinary characters, with no image. Works in a terminal (`emacs -nw`) as well
+  as graphical frames. An indicator shows its `:text` glyph, the character
+  mapped for its `:shape` in `svg-margin-shape-characters`, or
+  `svg-margin-text-fallback`; `:color`/`:face` colour it (`:draw`, `:font`,
+  `:weight` and `:scale` are honoured only by the SVG renderer).
+
+```elisp
+(setq svg-margin-renderer 'text)
+```
+
+> **Glyph width matters.** The built-in margin reserves width in *whole
+> character cells*, so only glyphs with a single, consistent cell advance line
+> up. Many Nerd Font, emoji and CJK icon glyphs are 1.5–2 cells wide (and
+> ligatures vary), so they overflow or misalign their column under the `text`
+> renderer — keep the `svg` renderer for arbitrary icons.
+
+## Switching arrangement / renderer at runtime
+
+`svg-margin-arrangement` and `svg-margin-renderer` apply immediately — the
+display re-renders whether you change them via `M-x customize` or these
+commands:
+
+| Command                          | Effect                          |
+|----------------------------------|---------------------------------|
+| `svg-margin-set-arrangement`     | pick `fill` or `fixed`          |
+| `svg-margin-toggle-arrangement`  | flip `fill` ⇄ `fixed`           |
+| `svg-margin-set-renderer`        | pick `svg` or `text`            |
+| `svg-margin-toggle-renderer`     | flip `svg` ⇄ `text`             |
+
+Arrangement and renderer are independent, so the two toggles cover all four
+combinations — handy for eyeballing each while developing a provider. (A plain
+`setq` of these variables does *not* re-render on its own; use the commands,
+Customize, or follow it with `M-x svg-margin-refresh-all`.)
 
 ## Reclaiming the fringe
 

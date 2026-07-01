@@ -36,6 +36,11 @@
 ;; every indicator for a line/side into ONE SVG image at exact pixel
 ;; coordinates.  Both the left and right margins are supported.
 ;;
+;; The renderer-independent COMPOSITOR -- the provider registry, indicator
+;; collection, and per-line column arrangement -- lives in `svg-margin-core';
+;; this file is the SVG renderer and window-margin engine that draws the
+;; layout it produces.
+;;
 ;; This is the rendering ENGINE only.  It ships no providers; you (or a
 ;; small adapter) supply them.  A provider is just a function of one
 ;; argument BUFFER that returns a list of indicator plists:
@@ -50,7 +55,10 @@
 ;; An indicator plist recognises:
 ;;   :pos / :line  buffer position or 1-based line (one is required)
 ;;   :side         `left' (default `svg-margin-default-side') or `right'
-;;   :column       explicit slot (0 = nearest the text); else auto-packed
+;;   :column       column index (0 = nearest the text).  Under the default
+;;                 `fill' arrangement a free `:column' is honoured and the
+;;                 others auto-pack around it; under `fixed' it is a dedicated
+;;                 lane (see `svg-margin-arrangement').
 ;;   :priority     higher is packed first (default 0)
 ;;   :shape        a registered shape symbol (see `svg-margin-define-shape')
 ;;   :text         a short string drawn centred (e.g. an evil mark letter)
@@ -82,6 +90,20 @@
 ;; line.  Providers are decoupled, so several packages can contribute to the
 ;; same gutter and stack on one line.
 ;;
+;; `svg-margin-arrangement' chooses how columns are assigned: the default
+;; `fill' packs indicators densely by `:priority', while `fixed' gives each
+;; `:column' a dedicated lane kept on every line -- so a provider always sits
+;; in the same column.  `svg-margin-provider-columns' assigns a provider's
+;; lane declaratively (see also `svg-margin-provider-sides').
+;;
+;; `svg-margin-renderer' selects the drawing backend: `svg' (default) composites
+;; each line into one image, while `text' draws each indicator's glyph straight
+;; into the built-in margin as characters (no image support required).  Beware:
+;; the built-in margin reserves width in whole character cells, so only glyphs
+;; with a single, consistent cell advance line up under the `text' renderer --
+;; wide Nerd Font, emoji and CJK icon glyphs overflow their column, so keep the
+;; `svg' renderer for arbitrary icons.
+;;
 ;; Note: a provider is called with the whole (widened) buffer on every
 ;; (debounced) render, so keep its scan cheap -- or cache it -- in large
 ;; buffers; the engine itself does no per-line work beyond what providers emit.
@@ -102,33 +124,36 @@
 (require 'cl-lib)
 (require 'color)
 (require 'subr-x)
-
-(defgroup svg-margin nil
-  "Multi-provider SVG indicators in the window margins."
-  :group 'convenience
-  :prefix "svg-margin-")
+(require 'svg-margin-core)
 
 (defcustom svg-margin-column-width 1
   "Width of one indicator column, in character cells.
 The reserved margin width (in columns, as `set-window-margins' measures it)
 is this value times the number of indicator columns on the widest line."
-  :type 'integer)
+  :type 'integer
+  :group 'svg-margin)
 
-(defcustom svg-margin-default-side 'left
-  "Default margin side for indicators that do not specify `:side'."
-  :type '(choice (const left) (const right)))
+(defcustom svg-margin-renderer 'svg
+  "Backend used to draw the composed indicators into the margin.
+`svg' (the default) composites each line's indicators into one SVG image --
+rich shapes, arbitrary colours and exact pixel placement, but it needs a
+graphical frame with SVG support.  `text' instead draws each indicator's glyph
+straight into the built-in margin as ordinary characters, needing no image.
 
-(defcustom svg-margin-min-left-columns 0
-  "Minimum number of columns to always reserve in the left margin.
-The left margin still grows past this when a line needs more columns, but
-never shrinks below it -- so reserving a baseline keeps buffer text from
-shifting left/right as indicators come and go (up to this width)."
-  :type 'integer)
+The `text' renderer shows an indicator's `:text' glyph, else the character
+mapped for its `:shape' in `svg-margin-shape-characters', else
+`svg-margin-text-fallback'; `:color'/`:face' colour it, while
+`:draw'/`:font'/`:weight'/`:scale' are honoured only by `svg'.
 
-(defcustom svg-margin-min-right-columns 0
-  "Minimum number of columns to always reserve in the right margin.
-See `svg-margin-min-left-columns'."
-  :type 'integer)
+IMPORTANT: the built-in margin reserves width in whole character cells, so a
+glyph whose advance is not a single, consistent cell -- many Nerd Font, emoji
+and CJK icon glyphs are 1.5-2 cells wide, and ligatures vary -- overflows or
+misaligns its column.  Use only single-cell-advance glyphs with the `text'
+renderer, or keep `svg' for arbitrary icons."
+  :type '(choice (const :tag "SVG image" svg)
+                 (const :tag "Built-in margin text" text))
+  :set #'svg-margin--custom-set
+  :group 'svg-margin)
 
 (defcustom svg-margin-disable-fringe nil
   "Which window fringe(s) svg-margin collapses to 0 while active.
@@ -137,33 +162,20 @@ named fringe(s) so the margin reclaims the space.  Restored on mode exit.
 Note: zeroing a fringe also hides its truncation/continuation arrows."
   :type '(choice (const :tag "Leave fringe alone" nil)
                  (const left) (const right)
-                 (const :tag "Both" both) (const :tag "Both (t)" t)))
+                 (const :tag "Both" both) (const :tag "Both (t)" t))
+  :group 'svg-margin)
 
 (defcustom svg-margin-idle-delay 0.1
   "Idle seconds to coalesce changes before re-rendering a buffer."
-  :type 'number)
-
-(defcustom svg-margin-provider-sides nil
-  "Alist of (PROVIDER-NAME . SIDE) overriding where a provider draws.
-SIDE is `left' or `right'.  An entry here forces every indicator from that
-provider onto SIDE, even one that stamps its own `:side' -- so you can move
-any provider (including a third-party one) to the other margin declaratively,
-without editing its source.  See also the `:side' argument to
-`svg-margin-register-provider'."
-  :type '(alist :key-type symbol :value-type (choice (const left) (const right))))
-
-(defcustom svg-margin-debug nil
-  "When non-nil, report indicators that are dropped for lack of a position.
-A provider whose indicator has no `:pos'/`:line' (or an out-of-range one) has
-that indicator silently skipped; enable this to get a message naming the
-provider, which helps when writing one."
-  :type 'boolean)
+  :type 'number
+  :group 'svg-margin)
 
 (defface svg-margin-help '((t :inherit highlight))
   "Face for an indicator's hover help (its `help-echo').
 With tooltips off the help shows in the echo area, where this contrasting
 background makes the cue stand out; the face is carried into the echo area,
-so it works there as well as in a tooltip.")
+so it works there as well as in a tooltip."
+  :group 'svg-margin)
 
 (defface svg-margin-cell
   '((t :inherit default :overline nil :underline nil :box nil
@@ -171,23 +183,27 @@ so it works there as well as in a tooltip.")
   "Face for svg-margin's margin cell (the overlay string carrying the image).
 It inherits `default' but explicitly clears the line decorations so a heading
 or line face -- e.g. an `:overline' on `org-level-N' -- does not bleed across
-the margin.  This is why it is applied to every margin string, not just org's.")
+the margin.  This is why it is applied to every margin string, not just org's."
+  :group 'svg-margin)
 
 (defcustom svg-margin-help-face 'svg-margin-help
   "Face applied to the indicator hover help, or nil to leave it unstyled."
-  :type '(choice (const :tag "No face" nil) face))
+  :type '(choice (const :tag "No face" nil) face)
+  :group 'svg-margin)
 
 (defcustom svg-margin-hover-highlight nil
   "When non-nil, draw a background behind the indicator under the mouse.
 The hover signal arrives through the help-echo machinery, so this also needs a
 `show-help-function' that feeds `svg-margin-note-help'.  The easy way to get
 both is `svg-margin-hover-mode', which sets this and installs that wrapper."
-  :type 'boolean)
+  :type 'boolean
+  :group 'svg-margin)
 
 (defcustom svg-margin-hover-color nil
   "Background colour drawn behind the hovered indicator.
 nil uses the `highlight' face background."
-  :type '(choice (const :tag "highlight face" nil) color))
+  :type '(choice (const :tag "highlight face" nil) color)
+  :group 'svg-margin)
 
 (defvar svg-margin--hovered nil
   "The cell under the mouse as (BUFFER POS SIDE COLUMN), or nil.
@@ -260,124 +276,21 @@ rectangle whose top-left is (X, Y) and size is W by H pixels."
              (triangle . svg-margin--shape-triangle)))
   (svg-margin-define-shape (car s) (cdr s)))
 
-;;;; Providers
-;; ----------------------------------------------------------------
+(defcustom svg-margin-shape-characters
+  '((dot . "●") (circle . "○") (bar . "│") (box . "■") (triangle . "▶"))
+  "Alist mapping a shape symbol to the character drawn for it in `text' mode.
+Used only by the `text' `svg-margin-renderer' (the `svg' renderer draws the
+shape as a vector).  An indicator carrying a `:text' glyph uses that instead;
+one whose shape is unlisted falls back to `svg-margin-text-fallback'.  Pick
+single-cell-advance characters (see `svg-margin-renderer')."
+  :type '(alist :key-type symbol :value-type string)
+  :group 'svg-margin)
 
-(defvar svg-margin--providers nil
-  "Alist of (NAME . PLIST); PLIST has :fn and optional :side/:priority/:column.
-The optional values are per-provider DEFAULTS applied to any indicator that
-omits the corresponding key (see `svg-margin--apply-provider-defaults').")
-
-;;;###autoload
-(cl-defun svg-margin-register-provider (name fn &key side priority column)
-  "Register provider FN under NAME (a symbol), replacing any prior one.
-FN is called with one argument, the buffer, and returns a list of indicator
-plists (see Commentary).  The optional keywords set per-provider DEFAULTS:
-SIDE (`left'/`right'), PRIORITY, and COLUMN are applied to any indicator this
-provider emits that does not specify them itself, so a provider need not stamp
-every indicator.  `svg-margin-provider-sides' can override SIDE per provider.
-Registered buffers are re-rendered."
-  (setf (alist-get name svg-margin--providers)
-        (list :fn fn :side side :priority priority :column column))
-  (svg-margin-refresh-all))
-
-;;;###autoload
-(defun svg-margin-unregister-provider (name)
-  "Remove the provider registered under NAME and re-render."
-  (setq svg-margin--providers (assq-delete-all name svg-margin--providers))
-  (svg-margin-refresh-all))
-
-(defun svg-margin--apply-provider-defaults (ind props override-side)
-  "Fill IND's missing :side/:priority/:column from provider PROPS.
-OVERRIDE-SIDE, when non-nil, forces `:side' regardless of what IND carries."
-  (let ((ind (copy-sequence ind)))
-    (when (and (plist-get props :side) (not (plist-member ind :side)))
-      (setq ind (plist-put ind :side (plist-get props :side))))
-    (when (and (plist-get props :priority) (not (plist-member ind :priority)))
-      (setq ind (plist-put ind :priority (plist-get props :priority))))
-    (when (and (plist-get props :column) (not (plist-member ind :column)))
-      (setq ind (plist-put ind :column (plist-get props :column))))
-    (when override-side
-      (setq ind (plist-put ind :side override-side)))
-    ind))
-
-;;;; Collection, normalisation, grouping
-;; ----------------------------------------------------------------
-
-(defun svg-margin--normalize (ind)
-  "Return a normalised copy of indicator IND, or nil if it has no position.
-The result carries a `:pos' at beginning-of-line and a `:side' of `left'
-or `right'.  `:line' and `:pos' are resolved against the WHOLE buffer (the
-position math widens), so line numbers are absolute regardless of narrowing."
-  (save-restriction
-    (widen)
-    (let* ((pos (or (plist-get ind :pos)
-                    (and (plist-get ind :line)
-                         (save-excursion
-                           (goto-char (point-min))
-                           (forward-line (1- (plist-get ind :line)))
-                           (point)))))
-           (side (or (plist-get ind :side) svg-margin-default-side)))
-      (when (and pos (<= (point-min) pos (point-max)))
-        (let ((bol (save-excursion (goto-char pos) (line-beginning-position))))
-          (append (list :pos bol :side (if (memq side '(right right-margin)) 'right 'left))
-                  ind))))))
-
-(defun svg-margin--collect ()
-  "Run every provider against the current buffer and return all indicators.
-Per-provider defaults and `svg-margin-provider-sides' overrides are applied,
-and (when `svg-margin-debug') position-less indicators are reported."
-  (let ((buf (current-buffer)) (out nil))
-    (dolist (p svg-margin--providers)
-      (let* ((name (car p)) (props (cdr p)) (fn (plist-get props :fn))
-             (override (alist-get name svg-margin-provider-sides)))
-        (condition-case err
-            (dolist (ind (funcall fn buf))
-              (let* ((ind (svg-margin--apply-provider-defaults ind props override))
-                     (n (svg-margin--normalize ind)))
-                (if n
-                    (push n out)
-                  (when svg-margin-debug
-                    (message "svg-margin: provider %s dropped an indicator (no/out-of-range :pos/:line): %S"
-                             name ind)))))
-          (error (message "svg-margin: provider %s failed: %s"
-                          name (error-message-string err))))))
-    out))
-
-(defun svg-margin--group (indicators)
-  "Group INDICATORS into a hash keyed by (POS . SIDE) -> list of indicators."
-  (let ((h (make-hash-table :test 'equal)))
-    (dolist (ind indicators)
-      (push ind (gethash (cons (plist-get ind :pos) (plist-get ind :side)) h)))
-    h))
-
-(defun svg-margin--pack-columns (indicators)
-  "Assign each of INDICATORS a column, packing them side by side.
-Higher `:priority' is placed first.  An explicit free `:column' is
-honoured; otherwise the lowest unoccupied column is used.  A `:background'
-indicator is not packed: its cell carries a nil `:column' -- it claims no
-slot and is drawn behind the packed cells, spanning the full image width.
-Returns a list of (:indicator IND :column N-or-nil)."
-  (let ((sorted (sort (copy-sequence indicators)
-                      (lambda (a b) (> (or (plist-get a :priority) 0)
-                                       (or (plist-get b :priority) 0)))))
-        (used nil) (result nil))
-    (dolist (ind sorted)
-      (if (plist-get ind :background)
-          (push (list :indicator ind :column nil) result)
-        (let ((col (plist-get ind :column)))
-          (when (or (null col) (memq col used))
-            (setq col 0)
-            (while (memq col used) (setq col (1+ col))))
-          (push col used)
-          (push (list :indicator ind :column col) result))))
-    (nreverse result)))
-
-(defun svg-margin--max-column (packed)
-  "Return the number of columns occupied by PACKED (max column + 1).
-A background cell (nil `:column') occupies no column."
-  (1+ (apply #'max -1 (mapcar (lambda (c) (or (plist-get c :column) -1))
-                              packed))))
+(defcustom svg-margin-text-fallback "•"
+  "Character drawn in `text' mode for an indicator with no `:text' or mapped shape.
+See `svg-margin-shape-characters' and `svg-margin-renderer'."
+  :type 'string
+  :group 'svg-margin)
 
 ;;;; Drawing
 ;; ----------------------------------------------------------------
@@ -514,6 +427,77 @@ not consulted (the area id becomes an event prefix)."
             (make-symbol (format "svg-margin-area-%d-%s-%d" pos side col))
             props))))
 
+;;;; Text renderer (built-in margin, no image)
+;; ----------------------------------------------------------------
+
+(defun svg-margin--cell-glyph (ind)
+  "Return the glyph string to draw for indicator IND in `text' mode.
+Its `:text', else the character mapped for its `:shape' in
+`svg-margin-shape-characters', else `svg-margin-text-fallback'."
+  (or (plist-get ind :text)
+      (alist-get (plist-get ind :shape) svg-margin-shape-characters)
+      svg-margin-text-fallback))
+
+(defun svg-margin--text-face (ind &optional background)
+  "Return the face for IND's glyph in `text' mode: its colour, plus BACKGROUND.
+Uses IND's `:face' as-is, or an anonymous face from its `:color'; BACKGROUND,
+when non-nil, is a colour drawn behind the glyph (the hover highlight).
+`:font', `:weight' and `:scale' are honoured only by the `svg' renderer."
+  (let* ((color (plist-get ind :color))
+         (base (cond (color (list :foreground color))
+                     ((plist-get ind :face))))
+         (bg (and background (list :background background))))
+    (cond ((and base bg) (list base bg))
+          (t (or base bg)))))
+
+(defun svg-margin--text-margin (packed side rcols pos hovered-col)
+  "Build the built-in-margin string drawing PACKED glyphs for SIDE.
+The string spans RCOLS columns, each `svg-margin-column-width' characters wide;
+column 0 is nearest the buffer text.  Each occupied cell shows its indicator's
+glyph (see `svg-margin--cell-glyph') faced with its colour and tagged -- via a
+`svg-margin-cell' help-echo property (BUFFER POS SIDE COLUMN) -- so hover
+tracking and per-cell tooltips work; empty cells are spaces.  A `:background'
+indicator tints the whole string's background.  HOVERED-COL, when it is a
+cell's column, draws the hover background behind that cell."
+  (let ((w (max 1 svg-margin-column-width))
+        (bg nil)
+        (cells (make-vector rcols nil))
+        (parts nil))
+    (dolist (cell packed)
+      (let ((col (plist-get cell :column)) (ind (plist-get cell :indicator)))
+        (if (null col)
+            (setq bg (svg-margin--indicator-color ind))   ; background tint
+          (when (< col rcols) (aset cells col cell)))))
+    (dotimes (i rcols)
+      ;; Left margin: leftmost char is the highest column, column 0 rightmost
+      ;; (nearest text).  Right margin: column 0 leftmost.
+      (let* ((col (if (eq side 'left) (- rcols 1 i) i))
+             (cell (aref cells col))
+             (ind (and cell (plist-get cell :indicator)))
+             (glyph (if ind (svg-margin--cell-glyph ind) " "))
+             (hov (and hovered-col (eql col hovered-col) (svg-margin--hover-color)))
+             (face (if ind (svg-margin--text-face ind hov)
+                     (and hov (list :background hov))))
+             (pad (max 0 (- w (string-width glyph))))
+             (s (concat glyph (make-string pad ?\s))))
+        (when face (setq s (propertize s 'face face)))
+        (when ind
+          (let ((eh (svg-margin--area-help ind)))
+            (when (and eh (> (length eh) 0))
+              (setq eh (copy-sequence eh))
+              (when svg-margin-help-face
+                (put-text-property 0 (length eh) 'face svg-margin-help-face eh))
+              (put-text-property 0 (length eh) 'svg-margin-cell
+                                 (list (current-buffer) pos side col) eh)
+              (setq s (propertize s 'help-echo eh)))
+            (when (or (plist-get ind :action) (plist-get ind :menu))
+              (setq s (propertize s 'pointer 'hand)))))
+        (push s parts)))
+    (let ((str (apply #'concat (nreverse parts))))
+      (when bg
+        (add-face-text-property 0 (length str) (list :background bg) t str))
+      str)))
+
 ;;;; Overlays
 ;; ----------------------------------------------------------------
 
@@ -556,9 +540,10 @@ ITEMS is an alist of (LABEL . COMMAND); TITLE labels the menu."
   "Build a keymap dispatching a margin click to one of CLICKABLES.
 CLICKABLES is an alist of (COLUMN . INDICATOR).  Left/middle click runs the
 indicator's `:action'; right click (`down-mouse-3') pops up a menu of its
-`:menu' items.  SIDE, RCOLS and CW locate the clicked column.  A default
-\(catch-all) binding absorbs the image map area-id prefix that a margin click
-prepends; the click position then selects the indicator."
+`:menu' items.  SIDE, RCOLS and CW locate the clicked column.  Mouse events are
+bound directly (for the `text' renderer, or a click off any hot-spot) and under
+a default binding that absorbs the SVG image-map area-id prefix; either way the
+click position then selects the indicator."
   (let* ((at (lambda ()
                (let ((col (svg-margin--click-column
                            (event-start last-input-event) side rcols cw)))
@@ -579,19 +564,34 @@ prepends; the click position then selects the indicator."
     (define-key sub [down-mouse-1] #'ignore)
     (define-key sub [down-mouse-2] #'ignore)
     (define-key sub [mouse-3] #'ignore)
+    ;; The SVG renderer's image-map area click arrives as [AREA-ID mouse-1], so
+    ;; the [t] default catches the area-id prefix and dispatches via `sub'.  The
+    ;; `text' renderer (and a click off any hot-spot) arrives as a plain
+    ;; [mouse-1], so bind the mouse events directly on `km' too.
+    (define-key km [mouse-1] run)
+    (define-key km [mouse-2] run)
+    (define-key km [down-mouse-3] menu)
+    (define-key km [down-mouse-1] #'ignore)
+    (define-key km [down-mouse-2] #'ignore)
+    (define-key km [mouse-3] #'ignore)
     (define-key km [t] sub)
     km))
 
 (defun svg-margin--place (pos side packed rcols cw lh)
-  "Create an overlay at POS carrying the composite SIDE image for PACKED.
-RCOLS is the SIDE's reserved column count the image spans; CW and LH are the
-column pixel width and line height for the image."
+  "Create an overlay at POS carrying the composite SIDE margin for PACKED.
+The display object is an SVG image or, for the `text' `svg-margin-renderer', a
+glyph string.  RCOLS is the SIDE's reserved column count it spans; CW and LH are
+the column pixel width and line height (used by the SVG renderer)."
   (let* ((hovered-col (and svg-margin-hover-highlight svg-margin--hovered
                            (eq (nth 0 svg-margin--hovered) (current-buffer))
                            (eql (nth 1 svg-margin--hovered) pos)
                            (eq (nth 2 svg-margin--hovered) side)
                            (nth 3 svg-margin--hovered)))
-         (img (svg-margin--image packed pos side rcols cw lh hovered-col))
+         ;; The render backend produces the margin's display object: an SVG
+         ;; image, or a plain glyph string for the built-in-margin renderer.
+         (disp (if (eq svg-margin-renderer 'text)
+                   (svg-margin--text-margin packed side rcols pos hovered-col)
+                 (svg-margin--image packed pos side rcols cw lh hovered-col)))
          (marg (if (eq side 'left) 'left-margin 'right-margin))
          ;; Compose the line's tooltip from each indicator's full hint (label +
          ;; "click to ..." + menu).  Done at the STRING level because a margin
@@ -606,7 +606,7 @@ column pixel width and line height for the image."
          ;; Face neutralises line decorations (overline/underline/box/...) so a
          ;; heading or line face does not bleed across the margin (see
          ;; `svg-margin-cell').
-         (str (propertize " " 'display (list (list 'margin marg) img)
+         (str (propertize " " 'display (list (list 'margin marg) disp)
                           'face 'svg-margin-cell))
          ;; (COLUMN . INDICATOR) for indicators that are clickable (left-click
          ;; `:action' and/or right-click `:menu').
@@ -640,12 +640,22 @@ column pixel width and line height for the image."
 ;;;; Window geometry (margins + fringes)
 ;; ----------------------------------------------------------------
 
+(defun svg-margin--renderer-usable-p (&optional frame)
+  "Non-nil when the current `svg-margin-renderer' can draw on FRAME.
+The `text' renderer draws ordinary characters, so it works on any frame --
+including a terminal (`emacs -nw').  The `svg' renderer needs a graphical frame
+with image support, so it is gated to one; on a terminal it would reserve dead
+gutter space and show nothing."
+  (or (eq svg-margin-renderer 'text)
+      (display-graphic-p frame)))
+
 (defun svg-margin--windows ()
-  "Return the GRAPHICAL windows currently displaying the current buffer.
-Margins/fringes are only meaningful where the SVG can render, so terminal
-windows showing the same buffer are excluded (they would otherwise reserve
-dead gutter space)."
-  (cl-remove-if-not (lambda (w) (display-graphic-p (window-frame w)))
+  "Return the windows the current renderer can draw into for this buffer.
+Windows showing the current buffer, filtered to those whose frame the renderer
+can use (see `svg-margin--renderer-usable-p') -- every window for `text', only
+graphical ones for `svg' (a terminal window would otherwise reserve dead gutter
+space)."
+  (cl-remove-if-not (lambda (w) (svg-margin--renderer-usable-p (window-frame w)))
                     (get-buffer-window-list (current-buffer) nil t)))
 
 (defvar-local svg-margin--saved-display nil
@@ -755,9 +765,12 @@ immediately, instead of popping in -- and shifting the text -- after the
 debounced re-render.")
 
 (defun svg-margin--render (&optional buffer)
-  "Re-render all svg-margin indicators in BUFFER (default current)."
+  "Re-render all svg-margin indicators in BUFFER (default current).
+A no-op when the current `svg-margin-renderer' cannot draw on this frame -- the
+`svg' renderer needs a graphical one, while `text' also renders in a terminal
+\(see `svg-margin--renderer-usable-p')."
   (let ((buffer (or buffer (current-buffer))))
-    (when (and (buffer-live-p buffer) (display-graphic-p))
+    (when (and (buffer-live-p buffer) (svg-margin--renderer-usable-p))
       (with-current-buffer buffer
         (when (bound-and-true-p svg-margin-mode)
           ;; Widen so providers see -- and `:line'/`:pos' resolve against -- the
@@ -781,29 +794,21 @@ debounced re-render.")
                    ;; not scale with text-scale; widen the reservation by the
                    ;; same factor so the larger image is not clipped.
                    (scale (if win (/ (float (window-font-width win)) fcw) 1.0))
-                   (groups (svg-margin--group (svg-margin--collect)))
-                   (max-left (max 0 svg-margin-min-left-columns))
-                   (max-right (max 0 svg-margin-min-right-columns))
-                   (cells nil))
-              ;; Pass 1: pack each line and find the reserved width per side
-              ;; (at least the configured minimum).  Background-only lines
-              ;; (ncols 0) still get a cell -- they paint the width others
-              ;; reserve -- but contribute no width of their own.
-              (maphash
-               (lambda (key inds)
-                 (let* ((pos (car key)) (side (cdr key))
-                        (packed (svg-margin--pack-columns inds))
-                        (ncols (svg-margin--max-column packed)))
-                   (when (> ncols 0)
-                     (if (eq side 'left)
-                         (setq max-left (max max-left ncols))
-                       (setq max-right (max max-right ncols))))
-                   (when packed
-                     (push (list pos side packed) cells))))
-               groups)
-              ;; Pass 2: place each line filling its side's reserved width, so
+                   ;; The compositor (svg-margin-core) turns the collected
+                   ;; indicators into a renderer-independent layout: per-line
+                   ;; column assignments plus each side's reserved width (never
+                   ;; below the configured minimum).  This file only draws it.
+                   (layout (svg-margin--compose
+                            (svg-margin--collect)
+                            :min-left svg-margin-min-left-columns
+                            :min-right svg-margin-min-right-columns))
+                   (max-left (plist-get layout :left))
+                   (max-right (plist-get layout :right)))
+              ;; Place each line filling its side's reserved width, so
               ;; indicators align to the text regardless of per-line variation.
-              (dolist (c cells)
+              ;; A background-only line still gets a cell (it paints the width
+              ;; others reserve) but contributes no width of its own.
+              (dolist (c (plist-get layout :lines))
                 (cl-destructuring-bind (pos side packed) c
                   (svg-margin--place pos side packed
                                      (if (eq side 'left) max-left max-right)
@@ -895,19 +900,64 @@ is freshly displayed in a window."
     (when (buffer-local-value 'svg-margin-mode buf)
       (svg-margin--schedule buf))))
 
+;; Wire the compositor core's provider-change notification to the renderer, so
+;; `svg-margin-register-provider' / `svg-margin-unregister-provider' (defined in
+;; svg-margin-core) re-render the affected buffers without the core naming a
+;; renderer symbol.
+(setq svg-margin-refresh-function #'svg-margin-refresh-all)
+
+;;;###autoload
+(defun svg-margin-set-renderer (renderer)
+  "Set `svg-margin-renderer' to RENDERER and re-render every svg-margin buffer.
+RENDERER is `svg' or `text'; interactively, read it with completion."
+  (interactive
+   (list (intern (completing-read
+                  (format "Renderer (now %s): " svg-margin-renderer)
+                  '("svg" "text") nil t))))
+  (svg-margin--custom-set 'svg-margin-renderer renderer)
+  (when (called-interactively-p 'interactive)
+    (message "svg-margin-renderer is now `%s'" renderer)))
+
+;;;###autoload
+(defun svg-margin-toggle-renderer ()
+  "Toggle `svg-margin-renderer' between `svg' and `text' and re-render."
+  (interactive)
+  (svg-margin-set-renderer (if (eq svg-margin-renderer 'text) 'svg 'text)))
+
+;;;###autoload
+(defun svg-margin-set-arrangement (arrangement)
+  "Set `svg-margin-arrangement' to ARRANGEMENT and re-render every buffer.
+ARRANGEMENT is `fill' or `fixed'; interactively, read it with completion.  This
+sets the global symbol -- a per-side alist can still be set via Customize."
+  (interactive
+   (list (intern (completing-read
+                  (format "Arrangement (now %s): " svg-margin-arrangement)
+                  '("fill" "fixed") nil t))))
+  (svg-margin--custom-set 'svg-margin-arrangement arrangement)
+  (when (called-interactively-p 'interactive)
+    (message "svg-margin-arrangement is now `%s'" arrangement)))
+
+;;;###autoload
+(defun svg-margin-toggle-arrangement ()
+  "Toggle `svg-margin-arrangement' between `fill' and `fixed' and re-render."
+  (interactive)
+  (svg-margin-set-arrangement (if (eq svg-margin-arrangement 'fixed) 'fill 'fixed)))
+
 ;;;###autoload
 (define-minor-mode svg-margin-mode
-  "Display SVG indicators from registered providers in the window margins.
+  "Display indicators from registered providers in the window margins.
 Providers are registered globally with `svg-margin-register-provider'; this
 buffer-local mode renders whatever they contribute for the current buffer.
 
-svg-margin draws SVG images, so it only shows anything in a GRAPHICAL frame;
-in a terminal (`emacs -nw') it does nothing."
+The default `svg' `svg-margin-renderer' draws SVG images, so it only shows
+anything in a GRAPHICAL frame; in a terminal (`emacs -nw') it does nothing.  Set
+`svg-margin-renderer' to `text' to draw glyphs into the built-in margin instead,
+which works in terminals too."
   :lighter " SVGm"
   (if svg-margin-mode
       (progn
-        (unless (display-graphic-p)
-          (message "svg-margin-mode: needs a graphical frame; nothing will show in a terminal"))
+        (when (and (eq svg-margin-renderer 'svg) (not (display-graphic-p)))
+          (message "svg-margin-mode: the `svg' renderer needs a graphical frame; set `svg-margin-renderer' to `text' for terminals"))
         (add-hook 'after-change-functions #'svg-margin--after-change nil t)
         (add-hook 'window-configuration-change-hook #'svg-margin--window-config nil t)
         ;; A major-mode change kills the buffer-local state (including the
@@ -939,7 +989,8 @@ in a terminal (`emacs -nw') it does nothing."
 Called with no arguments in the candidate buffer; a non-nil return turns the
 mode on there.  The default, `svg-margin-file-buffer-p', enables in ordinary
 file-visiting buffers."
-  :type 'function)
+  :type 'function
+  :group 'svg-margin)
 
 (defun svg-margin--maybe-enable ()
   "Turn on `svg-margin-mode' where `svg-margin-global-predicate' allows."
@@ -948,7 +999,8 @@ file-visiting buffers."
 
 ;;;###autoload
 (define-globalized-minor-mode global-svg-margin-mode
-  svg-margin-mode svg-margin--maybe-enable)
+  svg-margin-mode svg-margin--maybe-enable
+  :group 'svg-margin)
 
 ;;;; Hover highlight
 ;; ----------------------------------------------------------------
@@ -973,6 +1025,7 @@ that feeds `svg-margin-note-help', and sets `svg-margin-hover-highlight' so the
 renderer draws `svg-margin-hover-color' behind the hovered cell.  It composes
 with other `show-help-function' users: each wrapper chains the prior."
   :global t
+  :group 'svg-margin
   (if svg-margin-hover-mode
       (progn
         (setq svg-margin-hover-highlight t)
