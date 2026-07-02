@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/chiply/svg-margin/compare/v0.1.6...v0.1.7) (2026-07-02)
+
+
+### Bug Fixes
+
+* stop line highlights bleeding into the text-renderer margin ([#14](https://github.com/chiply/svg-margin/issues/14)) ([a3bc2f2](https://github.com/chiply/svg-margin/commit/a3bc2f20f0d678e614a74b82f51247bb7a902f48))
+
 ## [0.1.6](https://github.com/chiply/svg-margin/compare/v0.1.5...v0.1.6) (2026-07-01)
 
 
