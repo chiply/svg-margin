@@ -441,7 +441,8 @@ Its `:text', else the character mapped for its `:shape' in
 (defun svg-margin--text-face (ind &optional background)
   "Return the face for IND's glyph in `text' mode: its colour, plus BACKGROUND.
 Uses IND's `:face' as-is, or an anonymous face from its `:color'; BACKGROUND,
-when non-nil, is a colour drawn behind the glyph (the hover highlight).
+when non-nil, is a colour drawn behind the glyph (hover highlight, a background
+tint, or the neutral cell background).
 `:font', `:weight' and `:scale' are honoured only by the `svg' renderer."
   (let* ((color (plist-get ind :color))
          (base (cond (color (list :foreground color))
@@ -456,11 +457,18 @@ The string spans RCOLS columns, each `svg-margin-column-width' characters wide;
 column 0 is nearest the buffer text.  Each occupied cell shows its indicator's
 glyph (see `svg-margin--cell-glyph') faced with its colour and tagged -- via a
 `svg-margin-cell' help-echo property (BUFFER POS SIDE COLUMN) -- so hover
-tracking and per-cell tooltips work; empty cells are spaces.  A `:background'
-indicator tints the whole string's background.  HOVERED-COL, when it is a
-cell's column, draws the hover background behind that cell."
+tracking and per-cell tooltips work; empty cells are spaces.  Every cell paints
+an explicit `svg-margin-cell' background so a transient highlight on the
+underlying line (show-paren, region, hl-line) does not bleed through the margin;
+a `:background' indicator tints the cells instead, and HOVERED-COL draws the
+hover background behind its cell."
   (let ((w (max 1 svg-margin-column-width))
         (bg nil)
+        ;; The margin cell's own background, painted behind every cell so a
+        ;; transient highlight on the underlying line (show-paren, region,
+        ;; hl-line) cannot bleed through an empty or glyph-only cell.
+        (defbg (let ((c (face-attribute 'svg-margin-cell :background nil t)))
+                 (and (stringp c) c)))
         (cells (make-vector rcols nil))
         (parts nil))
     (dolist (cell packed)
@@ -476,8 +484,11 @@ cell's column, draws the hover background behind that cell."
              (ind (and cell (plist-get cell :indicator)))
              (glyph (if ind (svg-margin--cell-glyph ind) " "))
              (hov (and hovered-col (eql col hovered-col) (svg-margin--hover-color)))
-             (face (if ind (svg-margin--text-face ind hov)
-                     (and hov (list :background hov))))
+             ;; Hover wins, then a background-indicator tint, then the neutral
+             ;; cell background -- so every cell paints an explicit background.
+             (cellbg (or hov bg defbg))
+             (face (if ind (svg-margin--text-face ind cellbg)
+                     (and cellbg (list :background cellbg))))
              (pad (max 0 (- w (string-width glyph))))
              (s (concat glyph (make-string pad ?\s))))
         (when face (setq s (propertize s 'face face)))
@@ -493,10 +504,7 @@ cell's column, draws the hover background behind that cell."
             (when (or (plist-get ind :action) (plist-get ind :menu))
               (setq s (propertize s 'pointer 'hand)))))
         (push s parts)))
-    (let ((str (apply #'concat (nreverse parts))))
-      (when bg
-        (add-face-text-property 0 (length str) (list :background bg) t str))
-      str)))
+    (apply #'concat (nreverse parts))))
 
 ;;;; Overlays
 ;; ----------------------------------------------------------------
