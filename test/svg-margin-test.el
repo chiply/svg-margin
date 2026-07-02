@@ -340,6 +340,30 @@
     (should (equal "•" (svg-margin--text-margin '((:indicator (:color "#fff") :column 0))
                                                 'left 1 1 nil)))))
 
+(ert-deftest svg-margin/text-margin-cell-background ()
+  "Every text cell paints an explicit background so a highlight on the
+underlying line (show-paren, region, hl-line) cannot bleed through the margin.
+The neutral background is `svg-margin-cell's; a `:background' indicator tints it."
+  (let ((svg-margin-column-width 1)
+        (orig (face-attribute 'svg-margin-cell :background nil nil)))
+    (unwind-protect
+        (progn
+          (set-face-attribute 'svg-margin-cell nil :background "#010203")
+          ;; No tint: empty and glyph cells both carry the neutral cell bg.
+          (let* ((packed '((:indicator (:color "#ff0000" :text "A") :column 0)))
+                 (str (svg-margin--text-margin packed 'left 2 1 nil))
+                 (empty (get-text-property 0 'face str))            ; leftmost = empty lane 1
+                 (glyph (get-text-property (1- (length str)) 'face str))) ; last = glyph lane 0
+            (should (equal '(:background "#010203") empty))
+            (should (member '(:background "#010203") glyph))
+            (should (member '(:foreground "#ff0000") glyph)))
+          ;; A `:background' indicator tints every cell, overriding the neutral bg.
+          (let* ((packed '((:indicator (:color "#00ff00"))
+                           (:indicator (:text "A") :column 0)))
+                 (str (svg-margin--text-margin packed 'left 2 1 nil)))
+            (should (equal '(:background "#00ff00") (get-text-property 0 'face str)))))
+      (set-face-attribute 'svg-margin-cell nil :background orig))))
+
 (ert-deftest svg-margin/renderer-usable-p ()
   "The `text' renderer is usable on any frame; `svg' needs a graphical one.
 Runs in batch, where `display-graphic-p' is nil (like a terminal)."
